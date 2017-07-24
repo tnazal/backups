@@ -1,0 +1,668 @@
+---
+title: ""
+output:
+  html_document: default
+  html_notebook: default
+---
+
+#MSNBC Podbusters - Models 2
+
+<br>
+<br>
+
+```{r, echo=F, warning=F, message=F}
+library(gridExtra)
+library(grid)
+library(DT)
+library(reshape)
+library(broom)
+library(factoextra)
+library(ggplot2)
+library(syuzhet)
+library(purrr)
+library(scales)
+library(stargazer)
+library(knitr)
+library(plm)
+library(lme4)
+library(nlme)
+library(tidyr)
+library(dplyr)
+```
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 10000)
+```
+
+```{r, echo=FALSE}
+opts_chunk$set(echo = F, warning = F, message = F)
+```
+
+```{r}
+mytheme <- theme(panel.background = element_blank(), 
+        panel.grid.major = element_line(color = "#d8d8d8", linetype = "dotted"), 
+        panel.grid.major.x = element_blank(), 
+        plot.title = element_text(hjust = 0.5),
+        axis.ticks.y=element_blank(),
+        strip.background = element_blank())
+
+```
+
+```{r}
+#Data preparation and selection
+d <- read.csv("C:/Users/206535097/Dropbox (NBCUniversal)/Morning Joe/MSNBC_Files_2015_long.csv")
+d$Date <- as.Date(d$Date)
+
+#subset and variable creation
+d_podbusters <- d %>% group_by(Program_New, Date, Telecast_Time) %>%
+  filter(MOP <= 60, all(c(1:60) %in% MOP,
+                        !(all(c(1:120) %in% MOP)),
+                        !(all(c(1:75) %in% MOP)))) %>% 
+  select(Date, Weekday,  Program_New, Telecast_Time, MOP, Average_Audience, commercial_variable,
+         commercial_block_id, Podbuster_Flag, Seconds_Btwen_Comms, Impressions_during,
+         Impressions_before, Impressions_after, Telecast_Duration, Duration, content_variable_MOP_content) 
+
+#short handle
+d_podbusters$Program_Short <- ifelse(grepl("Hayes", d_podbusters$Program_New) == T, "CH",
+                                ifelse(grepl("Maddow", d_podbusters$Program_New) == T, "RM",
+                                       ifelse(grepl("Matthews", d_podbusters$Program_New) == T, "CM",
+                                              ifelse(grepl("Odonnel", d_podbusters$Program_New) == T, "LO", NA))))
+
+#Make pods with flag one pod
+d_podbusters$comm_with_flag <- as.numeric(d_podbusters$commercial_variable | d_podbusters$Podbuster_Flag) 
+
+#pod/content segments variables 
+a <- d_podbusters %>%  
+  group_by(Program_New, Date, Telecast_Time) %>%
+  summarise(rle = list(rle(comm_with_flag))) #lengths of trails of 0s and 1s
+
+for (n in 1:nrow(a)){
+     a[["lengths"]][n] <- a[["rle"]][[n]]["lengths"]
+     a[["values"]][n] <- a[["rle"]][[n]]["values"]
+}
+
+a$rle <- NULL
+a <- unnest(a)
+
+a[a$values == 1, ]$values <- sequence(length(which(a$values == 1)))
+a[a$values == 0, ]$values <- NA
+
+a$pod_within <- NA
+a[!is.na(a$values), ]$pod_within <- (a %>% group_by(Program_New, Date, Telecast_Time) %>%
+  filter(!is.na(values)) %>% 
+  mutate(pod_within = row_number()))$pod_within
+
+a$content_segment <- NA
+a[is.na(a$values), ]$content_segment <-(a %>% group_by(Program_New, Date, Telecast_Time) %>%
+  filter(is.na(values)) %>% 
+  mutate(content_segment = row_number()))$content_segment
+
+#ennumerate different pods in data
+d_podbusters$pod_group <- (rep(a$values, a$lengths))
+
+#ennumerate different pods within episode
+d_podbusters$pod_group_in_episode <- (rep(a$pod_within, a$lengths))
+
+#include lead and trailing minute to pod
+d_podbusters$pod_group_jitter <- as.numeric(pmax(lag(d_podbusters$pod_group, 1),
+                                      lead(d_podbusters$pod_group, 1), na.rm = T)) 
+
+#ennumerate different content segments within episode
+d_podbusters$content_group_in_episode <- (rep(a$content_segment, a$lengths))
+
+#minute of jitter pod
+d_podbusters <- d_podbusters %>%
+  group_by(pod_group_jitter) %>%
+  mutate(MOPod_jitter = row_number()) 
+
+#Dummy for pod with podbuster
+d_podbusters <- d_podbusters %>%
+  group_by(pod_group) %>%
+  mutate(is_busted_pod = max(Podbuster_Flag)) 
+
+
+#Recalculate Impressions During for podbusted pods
+d_podbusters <-  d_podbusters %>%
+  group_by(Program_New, Date, Telecast_Time, pod_group_in_episode) %>% 
+  mutate(Impressions_during = ifelse(is.na(pod_group_in_episode), NA,
+                                      mean(Average_Audience) / 1000))
+#Recalculate Impressions After for podbusted pods
+d_podbusters <-  d_podbusters %>%
+  ungroup() %>% 
+  mutate(Impressions_after =  (lead(Average_Audience, 1) +
+                                   lead(Average_Audience, 2)) / 2,
+         Impressions_after = ifelse(is.na(pod_group_in_episode), NA,
+                                         Impressions_after)) %>% 
+  group_by(Program_New, Date, Telecast_Time, pod_group_in_episode) %>% 
+  mutate(Impressions_after = tail(Impressions_after, 1) / 1000)
+
+#Recalculate Impressions before for podbusted pods
+d_podbusters <-  d_podbusters %>%
+  ungroup() %>% 
+  mutate(Impressions_before =  (lag(Average_Audience, 1) +
+                                   lag(Average_Audience, 2)) / 2,
+         Impressions_before = ifelse(is.na(pod_group_in_episode), NA,
+                                         Impressions_before)) %>% 
+  group_by(Program_New, Date, Telecast_Time, pod_group_in_episode) %>% 
+  mutate(Impressions_before = head(Impressions_before, 1) / 1000)
+
+#Flag for Impressions after/ before that overlap with another pod
+d_podbusters <- d_podbusters %>%
+  ungroup() %>% 
+  mutate(is_after_a_pod = ifelse(lead(comm_with_flag, 1) == 1 |
+                                        lead(comm_with_flag, 2) == 1, 1, 0),
+         is_after_a_pod = ifelse(is.na(pod_group_in_episode), NA,
+                                         is_after_a_pod)) %>%
+  group_by(Program_New, Date, Telecast_Time, pod_group_in_episode) %>%
+  mutate(is_after_a_pod = tail(is_after_a_pod, 1))
+
+d_podbusters <- d_podbusters %>%
+  ungroup() %>% 
+  mutate(is_before_a_pod = ifelse(lag(comm_with_flag, 1) == 1 |
+                                        lag(comm_with_flag, 2) == 1, 1, 0),
+         is_before_a_pod = ifelse(is.na(pod_group_in_episode), NA,
+                                         is_before_a_pod)) %>%
+  group_by(Program_New, Date, Telecast_Time, pod_group_in_episode) %>%
+  mutate(is_before_a_pod = head(is_before_a_pod, 1)) 
+
+#Attach Cluster variable
+cluster_lookup <- read.csv("cluster_lookup.csv") %>% select(-X) %>% 
+  mutate(id = paste(Program_New, Date, Telecast_Time))
+
+d_podbusters <- d_podbusters %>%
+  mutate(id_temp = paste(Program_New, Date, Telecast_Time)) %>%
+  mutate(cluster = as.factor(cluster_lookup$cluster[match(id_temp, cluster_lookup$id)])) %>% 
+  select(-id_temp)
+
+#variable for minute of show when the pod beggins 
+d_podbusters <- d_podbusters %>% group_by(pod_group) %>%
+  mutate(first_MOPod = ifelse(!is.na(pod_group), MOP[1], NA))
+
+#total views per episode
+d_podbusters <- d_podbusters %>% group_by(Program_Short, Date, Telecast_Time) %>% 
+  mutate(Telecast_Total_Views = sum(Average_Audience) / Telecast_Duration) %>%  
+  select(-Telecast_Duration)
+
+#Cumulative Commercial Minutes Per Telecast
+a2 <- d_podbusters %>% group_by(Program_Short, Date, Telecast_Time, pod_group_in_episode) %>% 
+  summarise(Duration = mean(Duration)) %>%
+  mutate(Cumulative_Commercial_Seconds = cumsum(Duration)) %>%
+  mutate(Cumulative_Commercial_Seconds = ifelse(pod_group_in_episode ==1, 0,
+                                               ifelse(is.na(pod_group_in_episode) == T, NA , Cumulative_Commercial_Seconds))) %>%
+  select(-Duration)
+
+cols <- colnames(d_podbusters)
+
+d_podbusters <- merge(d_podbusters, a2)  
+d_podbusters <- d_podbusters %>% arrange(Program_New, Date, Weekday, Telecast_Time, MOP)
+d_podbusters <- d_podbusters[,c(cols, "Cumulative_Commercial_Seconds")]
+
+
+#Cumulative Content Minutes Per Telecast
+d_podbusters <- d_podbusters %>% group_by(Program_Short, Date, Telecast_Time) %>% 
+  mutate(Cumulative_Content_Seconds = ifelse(comm_with_flag == 1, 0, 1),
+         Cumulative_Content_Seconds = cumsum(Cumulative_Content_Seconds) * 60) 
+
+
+
+
+#Cumulative Content Minutes Per Telecast
+a3 <- d_podbusters %>% group_by(Program_Short, Date, Telecast_Time, content_group_in_episode) %>% 
+  summarise(content_variable_MOP_content = mean(content_variable_MOP_content)) %>%
+  mutate(Cumulative_Content_Seconds = cumsum(content_variable_MOP_content) * 60) %>%
+  mutate(Cumulative_Content_Seconds = ifelse(content_group_in_episode == 1, 0, Cumulative_Content_Seconds)) %>%
+  select(-content_variable_MOP_content)
+
+cols <- colnames(d_podbusters)
+
+d_podbusters <- merge(d_podbusters, a3)  
+d_podbusters <- d_podbusters %>% arrange(Program_New, Date, Weekday, Telecast_Time, MOP)
+d_podbusters <- d_podbusters[,c(cols, "Cumulative_Content_Seconds")]
+d_podbusters <- d_podbusters %>% group_by(Program_Short, Date, Telecast_Time) %>% 
+  mutate(Cumulative_Content_Seconds_temp = Cumulative_Content_Seconds[match(pod_group_in_episode,
+                                                     content_group_in_episode)],
+         
+         Cumulative_Content_Seconds_k = ifelse(pod_group_in_episode == max(pod_group_in_episode, na.rm = T),
+                                             Cumulative_Content_Seconds[max(content_group_in_episode, na.rm = T)],
+                                             Cumulative_Content_Seconds_temp))
+
+#############################################################################################
+
+#Month
+d_podbusters$Month <- as.factor(months(d_podbusters$Date))
+
+#Year
+d_podbusters$Year <- as.factor(gsub("\\-.*","",d_podbusters$Date))
+
+#Arrange Columns
+
+d_podbusters <- d_podbusters[c("Date", "Year","Month", "Weekday",
+                               colnames(d_podbusters)[-grep("Date|Year|Month|Weekday",
+                                                            colnames(d_podbusters))])]
+
+rm(a, a2, a3, n, cols, cluster_lookup)
+```
+
+```{r}
+#Podlevel Data
+d_podlevel <- d_podbusters %>%
+  filter(comm_with_flag == 1) %>%
+  select(-commercial_block_id, -MOP,
+         -pod_group_jitter, -content_variable_MOP_content,
+         -Seconds_Btwen_Comms, -content_group_in_episode,
+         -MOPod_jitter, -Podbuster_Flag, -commercial_variable,
+         -pod_group) %>%
+  group_by(Program_New, Program_Short, Date, Year, Month,
+           Weekday,Telecast_Time, pod_group_in_episode,
+           cluster) %>%
+         summarise_each(funs(mean)) %>%
+  ungroup() %>% 
+  select(-comm_with_flag)
+
+d_podlevel <- d_podlevel[c("is_busted_pod", colnames(d_podlevel)[-grep("is_busted_pod", colnames(d_podlevel))])]
+
+#subset for t-tests
+d_podlevel_ttest <- d_podbusters %>%
+         filter(comm_with_flag == 1) %>%
+         group_by(Program_New, Program_Short, Date, Telecast_Time, pod_group_in_episode) %>% 
+         select(Impressions_during, Impressions_after, is_busted_pod) %>% 
+         summarise_each(funs(mean))
+```
+
+```{r}
+#Telecast Level Data
+
+d_Telecast <- d_podbusters %>%
+  filter(comm_with_flag == 1) %>%
+  select(-commercial_block_id, -MOP,
+         -pod_group_jitter, -content_variable_MOP_content,
+         -Seconds_Btwen_Comms, -content_group_in_episode,
+         -MOPod_jitter, -Podbuster_Flag, -commercial_variable,
+         -pod_group) %>%
+  group_by(Program_New, Program_Short, Date, Year, Month,
+           Weekday, Telecast_Time) %>%
+  summarise(n_podbusters = sum(is_busted_pod),
+            n_pods = max(pod_group_in_episode),
+            Audience = mean(Telecast_Total_Views),
+            Total_Commercial_Seconds = max(Cumulative_Commercial_Seconds),
+            Total_Content_Seconds = max(Cumulative_Content_Seconds))
+
+
+```
+
+
+
+###Pod Distribution
+```{r, fig.height= 9, fig.width= 10}
+ggplot(a <- d_podbusters %>% filter(MOP <= 60) %>% 
+         mutate(pod_simple = ifelse(is_busted_pod == 1, 2,
+                                    ifelse(comm_with_flag == 0, NA, comm_with_flag)),
+                pod_simple = ifelse(is.na(pod_simple), "Content",
+                                    ifelse(pod_simple == 1, "No Podbuster",
+                                           ifelse(pod_simple == 2, "Podbuster", 0))))) +
+            geom_tile(aes(x = as.character(Date), y = MOP, fill = as.factor(pod_simple)), stat = "identity") +
+            ggtitle("Minute Distribution by Show") +
+  labs(fill = "Minute Type") +
+  scale_fill_manual(values = c("grey50", "#fc6153", "#35ffcc")) +
+            theme(axis.title.x=element_blank(),
+                  axis.text.x=element_blank(),
+                  axis.ticks.x=element_blank(),
+                  axis.title.y=element_blank(),
+                  axis.text.y=element_blank(),
+                  axis.ticks.y=element_blank(),
+                  strip.background = element_blank(),
+                  legend.position = "bottom") +
+            coord_flip() +
+            facet_wrap(~ Program_New, ncol = 4, scales = "free") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+###Average impressions
+
+<br>
+
+```{r, fig.height = 6, fig.width = 9}
+grid.arrange(ggplot(d_podlevel_ttest) +
+  geom_density(aes(x = Impressions_during, fill = as.factor(is_busted_pod)), alpha = 0.5, color = NA) +
+    ggtitle("Density") +
+  mytheme +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 11)),
+
+ggplot(d_podlevel_ttest) +
+  geom_histogram(aes(x = Impressions_during, fill = as.factor(is_busted_pod)), alpha = 0.5, binwidth = 10) +
+   ggtitle("Histogram") +
+  mytheme +
+  theme(legend.position = c(0.7, 0.8),
+        plot.title = element_text(size = 11)), 
+
+ncol = 2,
+top = textGrob("Impressions During Pods. Podbuster Treatment
+                            ",
+                            gp = gpar(fontsize = 14)) 
+)
+```
+
+<br>
+<br>
+<br>
+
+```{r, fig.height = 6, fig.width = 9}
+grid.arrange(ggplot(d_podlevel_ttest) +
+  geom_density(aes(x = Impressions_after, fill = as.factor(is_busted_pod)), alpha = 0.5, color = NA) +
+    ggtitle("Density") +
+  mytheme +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 11)),
+
+ggplot(d_podlevel_ttest) +
+  geom_histogram(aes(x = Impressions_after, fill = as.factor(is_busted_pod)), alpha = 0.5, binwidth = 10) +
+   ggtitle("Histogram") +
+  mytheme +
+  theme(legend.position = c(0.7, 0.8),
+        plot.title = element_text(size = 11)), 
+
+ncol = 2,
+top = textGrob("Impressions After Pods. Podbuster Treatment
+                            ",
+                            gp = gpar(fontsize = 14)) 
+)
+```
+
+<br>
+<br>
+<br>
+
+```{r, fig.height=10, fig.width=13}
+
+ggplot(d_podlevel_ttest) +
+  ggtitle("Impressions During Pods. Podbuster Treatment",
+          subtitle = "Histogram and Densities") +
+  geom_histogram(aes(x = Impressions_during, fill = as.factor(is_busted_pod)), alpha = 0.5, binwidth = 10) +
+  geom_density(aes(x = (Impressions_during + 1000), y = (..density.. * 26000 ),
+                   fill = as.factor(is_busted_pod)), alpha = 0.5, color = NA) +
+  #coord_cartesian(xlim = c(0, 2000)) +
+  scale_x_continuous(breaks = c(0, 500)) +
+  facet_wrap(~Program_New, scales = "free_y") + 
+  mytheme +
+    theme(legend.position = "none",
+          plot.subtitle = element_text(hjust = 0.5),
+          panel.spacing = unit(0, "cm"))
+
+
+
+```
+
+<br>
+<br>
+<br>
+
+```{r, fig.height=10, fig.width=13}
+ggplot(d_podlevel_ttest) +
+  ggtitle("Impressions After Pods. Podbuster Treatment",
+          subtitle = "Histogram and Densities") +
+  geom_histogram(aes(x = Impressions_after, fill = as.factor(is_busted_pod)), alpha = 0.5, binwidth = 10) +
+  geom_density(aes(x = (Impressions_after + 1000), y = (..density.. * 26000 ),
+                   fill = as.factor(is_busted_pod)), alpha = 0.5, color = NA) +
+  #coord_cartesian(xlim = c(0, 2000)) +
+  scale_x_continuous(breaks = c(0, 500)) +
+  facet_wrap(~Program_New, scales = "free_y") + 
+  mytheme +
+    theme(legend.position = "none",
+          plot.subtitle = element_text(hjust = 0.5),
+          panel.spacing = unit(0, "cm"))
+
+```
+
+<br>
+<br>
+<br>
+
+#### T Tests
+
+<br>
+
+```{r}
+
+t_tests <- as.data.frame(cbind(
+  
+  c("All", "All", "Chris Hayes", "Chris Hayes", "Chris Matthews", "Chris Matthews",
+    "Lawrence O'Donell", "Lawrence O'Donell", "Rachel Maddow","Rachel Maddow"),
+  c(rep(c("During", "After"), 5)),
+
+  c(t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1))$Impressions_during,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$statistic,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$statistic,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "CH"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$statistic,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "CH"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$statistic,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "CM"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$statistic,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "CM"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$statistic,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "LO"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$statistic,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "LO"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$statistic,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "RM"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$statistic,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "RM"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$statistic),
+  
+  
+  c(t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1))$Impressions_during,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$p.value,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$p.value,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "CH"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$p.value,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "CH"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$p.value,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "CM"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$p.value,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "CM"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$p.value,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "LO"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$p.value,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "LO"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$p.value,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "RM"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_during)$p.value,
+    
+    t.test((d_podlevel_ttest %>% filter(is_busted_pod == 1, Program_Short == "RM"))$Impressions_after,
+       (d_podlevel_ttest %>% filter(is_busted_pod == 0))$Impressions_after)$p.value)
+
+
+))
+
+colnames(t_tests) <- c("Cases", "Variable", "t.statistic", "p.value")
+t_tests$p.value <- round(as.numeric(as.character(t_tests$p.value)), 3) 
+t_tests$t.statistic <- round(as.numeric(as.character(t_tests$t.statistic)), 3)
+
+datatable(t_tests) %>% 
+  formatRound(columns = c(3,4), digits = 3)
+```
+
+<br>
+<br>
+<br>
+
+#### Models - Pod Level
+
+```{r}
+
+model_linear_during_all <- lm(Impressions_during ~. -cluster -Program_Short - Average_Audience -
+                              Date - Impressions_after - is_after_a_pod +
+                              Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel)
+
+model_linear_after_all <- lm(Impressions_after ~. -cluster -Program_Short - Average_Audience -
+                              Date + Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel)
+
+
+model_linear_during_RM <- lm(Impressions_during ~ is_busted_pod + Impressions_before +
+                              Year + Month + Weekday + Telecast_Time +
+                              pod_group_in_episode + is_before_a_pod + Impressions_before +
+                              Cumulative_Commercial_Seconds + first_MOPod +
+                              Telecast_Total_Views + Cumulative_Content_Seconds +
+                              Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel %>% 
+                                                                    filter(Program_Short == "RM"))
+
+model_linear_during_CM <- lm(Impressions_during ~ is_busted_pod + Impressions_before +
+                              Year + Month + Weekday + Telecast_Time +
+                              pod_group_in_episode + is_before_a_pod + Impressions_before +
+                              Cumulative_Commercial_Seconds + first_MOPod +
+                              Telecast_Total_Views + Cumulative_Content_Seconds +
+                              Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel %>% 
+                                                                    filter(Program_Short == "CM"))
+
+model_linear_during_CH <- lm(Impressions_during ~ is_busted_pod + Impressions_before +
+                              Year + Month + Weekday + Telecast_Time +
+                              pod_group_in_episode + is_before_a_pod + Impressions_before +
+                              Cumulative_Commercial_Seconds + first_MOPod +
+                              Telecast_Total_Views + Cumulative_Content_Seconds +
+                              Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel %>% 
+                                                                    filter(Program_Short == "CH"))
+
+model_linear_during_LO <- lm(Impressions_during ~ is_busted_pod + Impressions_before +
+                              Year + Month + Weekday +
+                              pod_group_in_episode + is_before_a_pod + Impressions_before +
+                              Cumulative_Commercial_Seconds + first_MOPod +
+                              Telecast_Total_Views + Cumulative_Content_Seconds +
+                              Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel %>% 
+                                                                    filter(Program_Short == "LO"))
+
+
+model_linear_after_RM <- lm(Impressions_after ~ is_busted_pod + Impressions_before +
+                              is_after_a_pod + Year + Month + Weekday + Telecast_Time +
+                              pod_group_in_episode + is_before_a_pod + Impressions_before +
+                              Cumulative_Commercial_Seconds + first_MOPod + Impressions_during +
+                              Telecast_Total_Views + Cumulative_Content_Seconds +
+                              Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel %>% 
+                                                                    filter(Program_Short == "RM"))
+
+model_linear_after_CM <- lm(Impressions_after ~ is_busted_pod + Impressions_before +
+                              is_after_a_pod + Year + Month + Weekday + Telecast_Time +
+                              pod_group_in_episode + is_before_a_pod + Impressions_before +
+                              Cumulative_Commercial_Seconds + first_MOPod + Impressions_during +
+                              Telecast_Total_Views + Cumulative_Content_Seconds +
+                              Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel %>% 
+                                                                    filter(Program_Short == "CM"))
+
+model_linear_after_CH <- lm(Impressions_after ~ is_busted_pod + Impressions_before +
+                              is_after_a_pod + Year + Month + Weekday + Telecast_Time +
+                              pod_group_in_episode + is_before_a_pod + Impressions_before +
+                              Cumulative_Commercial_Seconds + first_MOPod + Impressions_during +
+                              Telecast_Total_Views + Cumulative_Content_Seconds +
+                              Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel %>% 
+                                                                    filter(Program_Short == "CH"))
+
+model_linear_after_LO <- lm(Impressions_after ~ is_busted_pod + Impressions_before +
+                              is_after_a_pod + Year + Month + Weekday +
+                              pod_group_in_episode + is_before_a_pod + Impressions_before +
+                              Cumulative_Commercial_Seconds + first_MOPod + Impressions_during +
+                              Telecast_Total_Views + Cumulative_Content_Seconds +
+                              Impressions_before * is_before_a_pod +
+                              pod_group_in_episode * Cumulative_Commercial_Seconds +
+                              pod_group_in_episode * Cumulative_Content_Seconds +
+                              pod_group_in_episode * first_MOPod, data = d_podlevel %>% 
+                                                                    filter(Program_Short == "LO"))
+
+```
+
+##### All shows
+
+###### Impressions During 
+
+```{r}
+summary(model_linear_during_all)
+```
+
+<br>
+<br>
+
+###### Impressions After
+
+```{r}
+summary(model_linear_after_all)
+```
+
+<br>
+<br>
+
+##### Per show
+
+###### Impressions During
+
+```{r, results='asis'}
+stargazer(model_linear_during_RM, model_linear_during_CM,
+          model_linear_during_CH, model_linear_during_LO,
+          column.labels = c("RM", "CM", "CH", "LO"),
+          type = "html")
+```
+
+<br>
+<br>
+
+###### Impressions After
+
+```{r, results='asis'}
+stargazer(model_linear_after_RM, model_linear_after_CM,
+          model_linear_after_CH, model_linear_after_LO,
+          column.labels = c("RM", "CM", "CH", "LO"),
+          type = "html")
+```
+
+
+#### Models - Telecast Level
+
+
+
+
+
